@@ -1,139 +1,170 @@
-from fastapi import FastAPI, UploadFile, File
-from fastapi.responses import JSONResponse
-import torch
-from PIL import Image
-import io
-import cv2
-import numpy as np
-from ultralytics import YOLO
-
-app = FastAPI(title="Currency Detection API")
-
-
-yolo_model = YOLO("C:\Users\sshak\OneDrive\Desktop\codes\nepali-currency-detection-\localization\train\models\best.pt")
-
-# Load classification model
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from torchvision import transforms
+from PIL import Image
+from fastapi import FastAPI, UploadFile, File
+from fastapi.responses import FileResponse
+from fastapi.staticfiles import StaticFiles
+from io import BytesIO
+import uvicorn
 
-class ImprovedMultiTaskCNN(nn.Module):
-    def __init__(self, num_countries, num_denoms):
-        super(ImprovedMultiTaskCNN, self).__init__()
-        
-        # --- Shared CNN Backbone ---
-        self.features = nn.Sequential(
-            # Block 1
-            nn.Conv2d(3, 64, kernel_size=3, padding=1),   # [B,64,224,224]
-            nn.BatchNorm2d(64),
-            nn.ReLU(),
-            nn.Conv2d(64, 64, kernel_size=3, padding=1),  # extra conv for richer features
-            nn.BatchNorm2d(64),
-            nn.ReLU(),
-            nn.MaxPool2d(2),                              # [B,64,112,112]
+# =====================================
+# MODEL DEFINITION
+# =====================================
+class MultiTaskAttentionModelSmallV2(nn.Module):
+    def __init__(self, num_countries, num_denoms, embed_dim=192, num_heads=6, dropout=0.25):
+        super(MultiTaskAttentionModelSmallV2, self).__init__()
 
-            # Block 2
-            nn.Conv2d(64, 128, kernel_size=3, padding=1),
-            nn.BatchNorm2d(128),
-            nn.ReLU(),
-            nn.Conv2d(128, 128, kernel_size=3, padding=1),
-            nn.BatchNorm2d(128),
-            nn.ReLU(),
-            nn.MaxPool2d(2),                              # [B,128,56,56]
+        # CNN backbone
+        self.conv1 = nn.Conv2d(3, 64, 3, 2, 1)
+        self.bn1 = nn.BatchNorm2d(64)
+        self.conv2 = nn.Conv2d(64, 128, 3, 2, 1)
+        self.bn2 = nn.BatchNorm2d(128)
+        self.conv3 = nn.Conv2d(128, embed_dim, 3, 2, 1)
+        self.bn3 = nn.BatchNorm2d(embed_dim)
+        self.conv4 = nn.Conv2d(embed_dim, embed_dim, 3, 1, 1)
+        self.bn4 = nn.BatchNorm2d(embed_dim)
+        self.conv5 = nn.Conv2d(embed_dim, embed_dim, 3, 1, 1)
+        self.bn5 = nn.BatchNorm2d(embed_dim)
 
-            # Block 3
-            nn.Conv2d(128, 256, kernel_size=3, padding=1),
-            nn.BatchNorm2d(256),
-            nn.ReLU(),
-            nn.Conv2d(256, 256, kernel_size=3, padding=1),
-            nn.BatchNorm2d(256),
-            nn.ReLU(),
-            nn.MaxPool2d(2),                              # [B,256,28,28]
+        # Positional embedding
+        self.pos_embedding = nn.Parameter(torch.randn(1, 196, embed_dim))
 
-            # Block 4
-            nn.Conv2d(256, 512, kernel_size=3, padding=1),
-            nn.BatchNorm2d(512),
-            nn.ReLU(),
-            nn.Conv2d(512, 512, kernel_size=3, padding=1),
-            nn.BatchNorm2d(512),
-            nn.ReLU(),
-            nn.AdaptiveAvgPool2d((1, 1))                  # [B,512,1,1]
+        # Transformer
+        encoder_layer = nn.TransformerEncoderLayer(
+            d_model=embed_dim, nhead=num_heads, batch_first=True, dim_feedforward=embed_dim * 2
         )
+        self.transformer = nn.TransformerEncoder(encoder_layer, num_layers=3)
 
-        # --- Task-specific Heads ---
-        self.country_head = nn.Sequential(
-            nn.Dropout(0.5),
-            nn.Linear(512, 256),
-            nn.ReLU(),
-            nn.Dropout(0.3),
-            nn.Linear(256, num_countries)
-        )
+        # Pooling + dropout
+        self.pool = nn.AdaptiveAvgPool1d(1)
+        self.dropout = nn.Dropout(dropout)
 
-        self.denom_head = nn.Sequential(
-            nn.Dropout(0.5),
-            nn.Linear(512, 256),
-            nn.ReLU(),
-            nn.Dropout(0.3),
-            nn.Linear(256, num_denoms)
-        )
+        # Heads
+        self.fc_country = nn.Linear(embed_dim, num_countries)
+        self.fc_denom = nn.Linear(embed_dim, num_denoms)
 
     def forward(self, x):
-        x = self.features(x)
-        x = x.view(x.size(0), -1)  # flatten [B,512]
-        country_out = self.country_head(x)
-        denom_out   = self.denom_head(x)
-        return country_out, denom_out
+        # CNN backbone
+        x = F.relu(self.bn1(self.conv1(x)))
+        x = F.relu(self.bn2(self.conv2(x)))
+        x = F.relu(self.bn3(self.conv3(x)))
+        x = F.relu(self.bn4(self.conv4(x)))
+        x = F.relu(self.bn5(self.conv5(x)))
+
+        B, C, H, W = x.shape
+        x = x.view(B, C, H * W).transpose(1, 2)
+
+        # Positional embedding
+        pos_emb = (
+            F.interpolate(self.pos_embedding.transpose(1, 2), size=x.size(1), mode="linear", align_corners=False).transpose(1, 2)
+            if x.size(1) > self.pos_embedding.size(1)
+            else self.pos_embedding[:, :x.size(1), :]
+        )
+        x = x + pos_emb
+
+        # Transformer
+        x = self.transformer(x)
+
+        # Pooling + dropout
+        x = x.transpose(1, 2)
+        x = self.pool(x).squeeze(-1)
+        x = self.dropout(x)
+
+        # Heads
+        country_logits = self.fc_country(x)
+        denom_logits = self.fc_denom(x)
+
+        return country_logits, denom_logits
 
 
-# Example load (modify to match your architecture)
-base_model = torch.load(r"C:\Users\sshak\OneDrive\Desktop\codes\nepali-currency-detection-\models\cnn_97%.pth", map_location="cpu")
-classifier = ImprovedMultiTaskCNN(num_countries=5, num_denoms=10)
-classifier.load_state_dict(base_model)
-classifier.eval()
+# =====================================
+# CONFIG
+# =====================================
+MODEL_PATH = r"C:\Users\sshak\OneDrive\Desktop\codes\nepali-currency-detection-\models\MultiTaskAttentionModelSmallV2.pth"
+DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+# Label mappings (keep same order used during training)
+country_labels = ["nepali", "indian", "bagladesh", "pakistan", "USA", "euro"]
+denom_labels = ["1", "2", "5", "10", "20", "50", "100", "200", "500", "1000", "2000", "5000"]
+
+# ✅ valid denominations (index-based, same as training)
+valid_denoms_per_country = {
+    "nepali": [2, 3, 4, 5, 6, 8, 9],
+    "indian": [3, 4, 5, 6, 7, 8, 10],
+    "bagladesh": [1, 2, 3, 4, 5, 6, 7, 8, 9],
+    "pakistan": [3, 4, 5, 6, 8, 9, 11],
+    "USA": [0, 1, 2, 3, 5, 6],
+    "euro": [2, 3, 4, 5, 6, 7, 8],
+}
+
+# =====================================
+# LOAD MODEL
+# =====================================
+model = MultiTaskAttentionModelSmallV2(
+    num_countries=len(country_labels),
+    num_denoms=len(denom_labels)
+)
+state_dict = torch.load(MODEL_PATH, map_location=DEVICE)
+model.load_state_dict(state_dict)
+model.to(DEVICE)
+model.eval()
+print("✅ Model loaded successfully on", DEVICE)
+
+# =====================================
+# TRANSFORMS
+# =====================================
+transform = transforms.Compose([
+    transforms.Resize((224, 224)),
+    transforms.ToTensor(),
+    transforms.Normalize(mean=[0.485, 0.456, 0.406],
+                         std=[0.229, 0.224, 0.225])
+])
 
 
-def read_image(upload_file: UploadFile):
-    image_bytes = upload_file.file.read()
-    image = Image.open(io.BytesIO(image_bytes)).convert("RGB")
-    return np.array(image)
+# =====================================
+# INFERENCE LOGIC
+# =====================================
+def predict(image: Image.Image):
+    img_tensor = transform(image).unsqueeze(0).to(DEVICE)
+    with torch.no_grad():
+        country_logits, denom_logits = model(img_tensor)
 
-def crop_image(image, box):
-    x1, y1, x2, y2 = map(int, box)
-    return image[y1:y2, x1:x2]
+        # --- Predict Country ---
+        country_idx = torch.argmax(country_logits, dim=1).item()
+        predicted_country = country_labels[country_idx]
 
-def preprocess_for_classifier(img_np):
-    img = Image.fromarray(cv2.resize(img_np, (224, 224)))
-    transform = torch.nn.Sequential(
-        torch.nn.Identity()  # Replace with your actual transforms (e.g., normalization)
-    )
-    tensor = torch.from_numpy(np.array(img)).permute(2, 0, 1).float().unsqueeze(0) / 255.0
-    return tensor
+        # --- Mask Invalid Denominations ---
+        denom_mask = torch.full_like(denom_logits, float('-inf'))
+        valid_indices = valid_denoms_per_country[predicted_country]
+        denom_mask[:, valid_indices] = denom_logits[:, valid_indices]
+
+        denom_idx = torch.argmax(denom_mask, dim=1).item()
+        predicted_denom = denom_labels[denom_idx]
+
+    return {"country": predicted_country, "denomination": predicted_denom}
 
 
-@app.post("/predict")
-async def predict(file: UploadFile = File(...)):
-    image = read_image(file)
-    results = yolo_model(image)
-
-    detections = []
-    for box in results[0].boxes.xyxy.tolist():
-        cropped = crop_image(image, box)
-        tensor = preprocess_for_classifier(cropped)
-
-        with torch.no_grad():
-            country_logits, amount_logits = classifier(tensor)
-            country_pred = torch.argmax(country_logits, dim=1).item()
-            amount_pred = torch.argmax(amount_logits, dim=1).item()
-
-        detections.append({
-            "box": box,
-            "country": int(country_pred),
-            "amount": int(amount_pred)
-        })
-
-    return JSONResponse(content={"detections": detections})
-
+# =====================================
+# FASTAPI APP
+# =====================================
+app = FastAPI(title="Currency Detection API (Attention-based)")
+app.mount("/static", StaticFiles(directory="static"), name="static")
 
 @app.get("/")
-def root():
-    return {"message": "Currency Detection API is running 🚀"}
+def home():
+    return FileResponse("static/index.html")
+
+@app.post("/predict")
+async def predict_currency(file: UploadFile = File(...)):
+    try:
+        image_bytes = await file.read()
+        image = Image.open(BytesIO(image_bytes)).convert("RGB")
+        result = predict(image)
+        return {"filename": file.filename, "prediction": result}
+    except Exception as e:
+        return {"error": str(e)}
+
+if __name__ == "__main__":
+    uvicorn.run(app, host="127.0.0.1", port=8000)
