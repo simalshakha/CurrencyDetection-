@@ -12,77 +12,113 @@ import uvicorn
 # =====================================
 # MODEL DEFINITION
 # =====================================
-class MultiTaskAttentionModelSmallV2(nn.Module):
-    def __init__(self, num_countries, num_denoms, embed_dim=192, num_heads=6, dropout=0.25):
-        super(MultiTaskAttentionModelSmallV2, self).__init__()
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
 
-        # CNN backbone
-        self.conv1 = nn.Conv2d(3, 64, 3, 2, 1)
-        self.bn1 = nn.BatchNorm2d(64)
-        self.conv2 = nn.Conv2d(64, 128, 3, 2, 1)
-        self.bn2 = nn.BatchNorm2d(128)
-        self.conv3 = nn.Conv2d(128, embed_dim, 3, 2, 1)
-        self.bn3 = nn.BatchNorm2d(embed_dim)
-        self.conv4 = nn.Conv2d(embed_dim, embed_dim, 3, 1, 1)
-        self.bn4 = nn.BatchNorm2d(embed_dim)
-        self.conv5 = nn.Conv2d(embed_dim, embed_dim, 3, 1, 1)
-        self.bn5 = nn.BatchNorm2d(embed_dim)
+class EnhancedMultiTaskCNN(nn.Module):
+    def __init__(self, num_countries, num_denoms):
+        super(EnhancedMultiTaskCNN, self).__init__()
 
-        # Positional embedding
-        self.pos_embedding = nn.Parameter(torch.randn(1, 196, embed_dim))
+        # --- Shared CNN Backbone ---
+        self.features = nn.Sequential(
+            # Block 1
+            nn.Conv2d(3, 64, kernel_size=3, padding=1),
+            nn.BatchNorm2d(64),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(64, 64, kernel_size=3, padding=1),
+            nn.BatchNorm2d(64),
+            nn.ReLU(inplace=True),
+            nn.MaxPool2d(2),  # [B,64,112,112]
 
-        # Transformer
-        encoder_layer = nn.TransformerEncoderLayer(
-            d_model=embed_dim, nhead=num_heads, batch_first=True, dim_feedforward=embed_dim * 2
+            # Block 2
+            nn.Conv2d(64, 128, kernel_size=3, padding=1),
+            nn.BatchNorm2d(128),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(128, 128, kernel_size=3, padding=1),
+            nn.BatchNorm2d(128),
+            nn.ReLU(inplace=True),
+            nn.MaxPool2d(2),  # [B,128,56,56]
+
+            # Block 3 (Added Dropout for better regularization)
+            nn.Conv2d(128, 256, kernel_size=3, padding=1),
+            nn.BatchNorm2d(256),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(256, 256, kernel_size=3, padding=1),
+            nn.BatchNorm2d(256),
+            nn.ReLU(inplace=True),
+            nn.Dropout2d(0.3),
+            nn.MaxPool2d(2),  # [B,256,28,28]
+
+            # Block 4
+            nn.Conv2d(256, 512, kernel_size=3, padding=1),
+            nn.BatchNorm2d(512),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(512, 512, kernel_size=3, padding=1),
+            nn.BatchNorm2d(512),
+            nn.ReLU(inplace=True),
+            nn.Dropout2d(0.4),
+            nn.MaxPool2d(2),  # [B,512,14,14]
+
+            # Block 5 (NEW: attention & deeper feature extraction)
+            nn.Conv2d(512, 512, kernel_size=3, padding=1),
+            nn.BatchNorm2d(512),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(512, 512, kernel_size=3, padding=1),
+            nn.BatchNorm2d(512),
+            nn.ReLU(inplace=True),
+
+            nn.AdaptiveAvgPool2d((1, 1))
         )
-        self.transformer = nn.TransformerEncoder(encoder_layer, num_layers=3)
 
-        # Pooling + dropout
-        self.pool = nn.AdaptiveAvgPool1d(1)
-        self.dropout = nn.Dropout(dropout)
+        # --- Squeeze-and-Excitation (Lightweight Attention) ---
+        self.se_block = nn.Sequential(
+            nn.Linear(512, 128),
+            nn.ReLU(inplace=True),
+            nn.Linear(128, 512),
+            nn.Sigmoid()
+        )
 
-        # Heads
-        self.fc_country = nn.Linear(embed_dim, num_countries)
-        self.fc_denom = nn.Linear(embed_dim, num_denoms)
+        # --- Task-specific Heads (deeper) ---
+        self.country_head = nn.Sequential(
+            nn.Dropout(0.5),
+            nn.Linear(512, 256),
+            nn.ReLU(inplace=True),
+            nn.BatchNorm1d(256),
+            nn.Dropout(0.3),
+            nn.Linear(256, 128),
+            nn.ReLU(inplace=True),
+            nn.Linear(128, num_countries)
+        )
+
+        self.denom_head = nn.Sequential(
+            nn.Dropout(0.5),
+            nn.Linear(512, 256),
+            nn.ReLU(inplace=True),
+            nn.BatchNorm1d(256),
+            nn.Dropout(0.3),
+            nn.Linear(256, 128),
+            nn.ReLU(inplace=True),
+            nn.Linear(128, num_denoms)
+        )
 
     def forward(self, x):
-        # CNN backbone
-        x = F.relu(self.bn1(self.conv1(x)))
-        x = F.relu(self.bn2(self.conv2(x)))
-        x = F.relu(self.bn3(self.conv3(x)))
-        x = F.relu(self.bn4(self.conv4(x)))
-        x = F.relu(self.bn5(self.conv5(x)))
+        x = self.features(x)
+        x = x.view(x.size(0), -1)  # flatten [B,512]
 
-        B, C, H, W = x.shape
-        x = x.view(B, C, H * W).transpose(1, 2)
+        # --- Attention scaling ---
+        scale = self.se_block(x)
+        x = x * scale
 
-        # Positional embedding
-        pos_emb = (
-            F.interpolate(self.pos_embedding.transpose(1, 2), size=x.size(1), mode="linear", align_corners=False).transpose(1, 2)
-            if x.size(1) > self.pos_embedding.size(1)
-            else self.pos_embedding[:, :x.size(1), :]
-        )
-        x = x + pos_emb
-
-        # Transformer
-        x = self.transformer(x)
-
-        # Pooling + dropout
-        x = x.transpose(1, 2)
-        x = self.pool(x).squeeze(-1)
-        x = self.dropout(x)
-
-        # Heads
-        country_logits = self.fc_country(x)
-        denom_logits = self.fc_denom(x)
-
-        return country_logits, denom_logits
+        country_out = self.country_head(x)
+        denom_out   = self.denom_head(x)
+        return country_out, denom_out
 
 
 # =====================================
 # CONFIG
 # =====================================
-MODEL_PATH = r"C:\Users\sshak\OneDrive\Desktop\codes\nepali-currency-detection-\models\MultiTaskAttentionModelSmallV2.pth"
+MODEL_PATH = r"C:\Users\sshak\OneDrive\Desktop\codes\nepali-currency-detection-\models\enhancedcnn_v2.pth"
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 # Label mappings (keep same order used during training)
