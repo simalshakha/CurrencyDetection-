@@ -138,7 +138,7 @@ state_dict = torch.load(MODEL_PATH, map_location=DEVICE)
 model.load_state_dict(state_dict)
 model.to(DEVICE)
 model.eval()
-print("✅ Model loaded successfully on", DEVICE)
+print(" Model loaded successfully on", DEVICE)
 
 
 transform = transforms.Compose([
