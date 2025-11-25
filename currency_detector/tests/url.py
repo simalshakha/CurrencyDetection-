@@ -1,0 +1,8 @@
+from fastapi.testclient import TestClient
+from currency_detector.main import app
+
+client = TestClient(app)
+
+def test_server_running():
+    response = client.get("/")
+    assert response.status_code == 200

@@ -1,5 +1,2 @@
 /data
 /models
-currency_detector\app\models
-currency_detector\Dockerfile
-currency_detector\.dockerignore
