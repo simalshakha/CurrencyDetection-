@@ -1,0 +1,10 @@
+__pycache__/
+*.pt
+*.zip
+*.tar
+*.csv
+dataset/
+data/
+logs/
+venv/
+outputs/

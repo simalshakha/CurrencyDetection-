@@ -1,0 +1,43 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <title>Currency Detection</title>
+  <style>
+    body { font-family: Arial; text-align:center; margin-top:50px; }
+    input, button { margin:10px; padding:10px; }
+  </style>
+</head>
+<body>
+  <h2> Currency Detection</h2>
+  <form id="upload-form">
+    <input type="file" id="file" accept="image/*" required>
+    <button type="submit">Upload & Predict</button>
+  </form>
+  <div id="result"></div>
+
+  <script>
+    const form = document.getElementById("upload-form");
+    form.addEventListener("submit", async (e) => {
+      e.preventDefault();
+      const fileInput = document.getElementById("file");
+      if (!fileInput.files.length) return alert("Select an image.");
+
+      const formData = new FormData();
+      formData.append("file", fileInput.files[0]);
+
+      const response = await fetch("/predict", { method: "POST", body: formData });
+      const data = await response.json();
+
+      if (data.error) {
+        document.getElementById("result").innerHTML = `<p style="color:red;">Error: ${data.error}</p>`;
+      } else {
+        document.getElementById("result").innerHTML = `
+          <p><strong>Country:</strong> ${data.prediction.country}</p>
+          <p><strong>Denomination:</strong> ${data.prediction.denomination}</p>
+        `;
+      }
+    });
+  </script>
+</body>
+</html>

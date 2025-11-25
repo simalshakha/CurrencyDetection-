@@ -1,0 +1,9 @@
+fastapi
+uvicorn
+python-multipart
+torch==2.2.0+cpu
+torchvision==0.17.0+cpu
+-f https://download.pytorch.org/whl/torch_stable.html
+numpy==1.26.2
+Pillow
+opencv-python-headless
